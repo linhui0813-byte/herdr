@@ -359,7 +359,7 @@ impl App {
             self.finish_checkpointed_pane_exit();
         }
         if let Some(agents) = manifest_update_agents {
-            self.reset_agent_detection_for_agents(&agents);
+            self.refresh_agent_detection_for_agents(&agents);
         }
         if let Some((pane_id, agent)) = released_agent {
             if pane_updates.iter().any(|update| update.pane_id == pane_id) {
@@ -409,7 +409,7 @@ impl App {
         pane_updates
     }
 
-    fn reset_agent_detection_for_agents(&self, agents: &[crate::detect::Agent]) {
+    fn refresh_agent_detection_for_agents(&self, agents: &[crate::detect::Agent]) {
         if agents.is_empty() {
             return;
         }
@@ -421,14 +421,14 @@ impl App {
                 continue;
             }
             if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
-                runtime.reset_agent_detection();
+                runtime.refresh_agent_detection();
             }
         }
     }
 
-    fn reset_all_agent_detection_runtimes(&self) {
+    fn refresh_all_agent_detection_runtimes(&self) {
         for runtime in self.terminal_runtimes.values() {
-            runtime.reset_agent_detection();
+            runtime.refresh_agent_detection();
         }
     }
 
@@ -995,7 +995,7 @@ impl App {
                 let summaries = crate::detect::manifest::reload_manifests();
                 self.state.agent_manifest_summaries = summaries.clone();
                 let update_status = crate::detect::manifest_update::load_status();
-                self.reset_all_agent_detection_runtimes();
+                self.refresh_all_agent_detection_runtimes();
                 SuccessResponse {
                     id: request.id,
                     result: ResponseResult::AgentManifestReload {
@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_activation_event_resets_matching_agent_detection_runtime() {
+    async fn manifest_activation_refreshes_matching_agent_without_lifecycle_reset() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -1469,7 +1469,7 @@ mod tests {
             .detected_agent = Some(Agent::Codex);
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
-        app.terminal_runtimes.insert(terminal_id, runtime);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         app.handle_internal_event(AppEvent::AgentDetectionManifestsUpdated {
             updated: Vec::new(),
@@ -1482,7 +1482,14 @@ mod tests {
             reset_notify.notified(),
         )
         .await
-        .expect("matching agent detection runtime should be reset");
+        .expect("matching agent detection runtime should refresh");
+        assert!(
+            !app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .agent_detection_reset_requested_for_test(),
+            "new rules must not reacquire an unchanged agent process"
+        );
     }
 
     #[test]
@@ -1572,7 +1579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_reload_agent_manifests_resets_detection_runtimes() {
+    async fn server_reload_agent_manifests_refreshes_detection_without_lifecycle_reset() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -1613,6 +1620,14 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        assert!(
+            !app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .agent_detection_reset_requested_for_test(),
+            "manual reload must preserve the detector's lifecycle baseline"
+        );
+
         #[cfg(unix)]
         app.terminal_runtimes
             .get(&terminal_id)
@@ -1625,7 +1640,7 @@ mod tests {
             reset_notify.notified(),
         )
         .await
-        .expect("manual manifest reload should reset detection runtimes");
+        .expect("manual manifest reload should refresh detection runtimes");
     }
 
     #[tokio::test]

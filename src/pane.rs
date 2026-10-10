@@ -74,6 +74,28 @@ pub(crate) const PANE_TERM: &str = crate::ghostty::TERM;
 pub(crate) const MIN_PANE_ROWS: u16 = 2;
 pub(crate) const MIN_PANE_COLS: u16 = 4;
 const PANE_COLORTERM: &str = "truecolor";
+
+#[derive(Default)]
+struct AgentDetectionWake {
+    notify: Arc<Notify>,
+    reset_requested: AtomicBool,
+}
+
+impl AgentDetectionWake {
+    fn refresh(&self) {
+        self.notify.notify_one();
+    }
+
+    fn reset(&self) {
+        self.reset_requested.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn take_reset(&self) -> bool {
+        // A lifecycle reset must win if a manifest refresh is also pending.
+        self.reset_requested.swap(false, Ordering::AcqRel)
+    }
+}
 const FISH_HANDLE_REFLOW_ENV_VAR: &str = "fish_handle_reflow";
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
@@ -937,10 +959,10 @@ fn spawn_basic_detection_task(
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
-    Arc<Notify>,
+    Arc<AgentDetectionWake>,
     Arc<Mutex<Option<PendingAgentRelease>>>,
 ) {
-    let detect_reset_notify = Arc::new(Notify::new());
+    let detect_reset_notify = Arc::new(AgentDetectionWake::default());
     let detect_reset = detect_reset_notify.clone();
     let pending_release = Arc::new(Mutex::new(None));
     let pending_release_for_task = pending_release.clone();
@@ -976,7 +998,16 @@ fn spawn_basic_detection_task(
             };
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
-                _ = detect_reset.notified() => {
+                _ = detect_reset.notify.notified() => {
+                    last_detection_text.clear();
+                    last_screen_scan_detection_content_seq = None;
+                    pending_idle.clear();
+                    if !detect_reset.take_reset() {
+                        // New rules invalidate screen evidence, not the live
+                        // process identity or its published lifecycle state.
+                        has_process_probe = false;
+                        continue;
+                    }
                     publish_codex_prompt_observation(
                         &state_events, pane_id, Some(Agent::Codex), "", None, false,
                         &mut last_codex_prompt_ready,
@@ -1513,7 +1544,7 @@ pub struct PaneRuntime {
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
-    detect_reset_notify: Arc<Notify>,
+    detect_reset_notify: Arc<AgentDetectionWake>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
@@ -2861,7 +2892,7 @@ impl PaneRuntime {
             let self_reported_agent_active_for_task = self_reported_agent_active.clone();
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
-            let detect_reset_notify = Arc::new(Notify::new());
+            let detect_reset_notify = Arc::new(AgentDetectionWake::default());
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
             let pending_release_for_task = pending_release.clone();
@@ -2911,7 +2942,16 @@ impl PaneRuntime {
                     };
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
-                        _ = detect_reset.notified() => {
+                        _ = detect_reset.notify.notified() => {
+                            last_detection_text.clear();
+                            last_screen_scan_detection_content_seq = None;
+                            pending_idle.clear();
+                            if !detect_reset.take_reset() {
+                                // Keep process and completion identity across
+                                // a rule refresh, including background jobs.
+                                has_process_probe = false;
+                                continue;
+                            }
                             publish_codex_prompt_observation(
                                 &state_events, pane_id, Some(Agent::Codex), "", None, false,
                                 &mut last_codex_prompt_ready,
@@ -3268,7 +3308,11 @@ impl PaneRuntime {
                 pending_release,
             )
         } else {
-            (None, Arc::new(Notify::new()), Arc::new(Mutex::new(None)))
+            (
+                None,
+                Arc::new(AgentDetectionWake::default()),
+                Arc::new(Mutex::new(None)),
+            )
         };
 
         Ok(Self {
@@ -3302,16 +3346,27 @@ impl PaneRuntime {
                 until: std::time::Instant::now() + RELEASE_REACQUIRE_SUPPRESSION,
             });
         }
-        self.detect_reset_notify.notify_one();
+        self.reset_agent_detection();
     }
 
     pub fn reset_agent_detection(&self) {
-        self.detect_reset_notify.notify_one();
+        self.detect_reset_notify.reset();
+    }
+
+    pub fn refresh_agent_detection(&self) {
+        self.detect_reset_notify.refresh();
     }
 
     #[cfg(test)]
     pub(crate) fn agent_detection_reset_notify_for_test(&self) -> Arc<Notify> {
-        self.detect_reset_notify.clone()
+        self.detect_reset_notify.notify.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_detection_reset_requested_for_test(&self) -> bool {
+        self.detect_reset_notify
+            .reset_requested
+            .load(Ordering::Acquire)
     }
 
     pub fn set_self_reported_agent_active(&self, active: bool) {
@@ -3324,7 +3379,7 @@ impl PaneRuntime {
             .full_lifecycle_authority_active
             .swap(active, Ordering::AcqRel);
         if active && !previous {
-            self.detect_reset_notify.notify_one();
+            self.reset_agent_detection();
         }
     }
 
@@ -4058,7 +4113,7 @@ impl PaneRuntime {
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
-                detect_reset_notify: Arc::new(Notify::new()),
+                detect_reset_notify: Arc::new(AgentDetectionWake::default()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 compression,
@@ -4135,6 +4190,44 @@ mod tests {
         assert!(!cache.text.contains("alt"));
         assert!(!refresh(&mut cache));
         assert_eq!(reads.get(), 7);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_detection_refresh_forces_read_without_new_output() {
+        let mut runtime = PaneRuntime::test_with_screen_bytes(20, 4, b"unchanged evidence");
+        let _events = runtime.test_start_basic_detection();
+        runtime.test_wait_for_detection_reads(1).await;
+        let revision = runtime.content_seq();
+        runtime.refresh_agent_detection();
+        runtime.test_wait_for_detection_reads(2).await;
+        assert_eq!(runtime.content_seq(), revision);
+        assert!(!runtime.agent_detection_reset_requested_for_test());
+    }
+
+    #[tokio::test]
+    async fn agent_detection_refresh_cannot_replace_pending_lifecycle_reset() {
+        for reset_first in [false, true] {
+            let wake = AgentDetectionWake::default();
+            if reset_first {
+                wake.reset();
+                wake.refresh();
+            } else {
+                wake.refresh();
+                wake.reset();
+            }
+            wake.notify.notified().await;
+            assert!(
+                wake.take_reset(),
+                "lifecycle reset must win in either order"
+            );
+            wake.refresh();
+            wake.notify.notified().await;
+            assert!(
+                !wake.take_reset(),
+                "later refresh should not reset lifecycle"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -5410,7 +5503,7 @@ mod tests {
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
-            detect_reset_notify: Arc::new(Notify::new()),
+            detect_reset_notify: Arc::new(AgentDetectionWake::default()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,
@@ -5450,7 +5543,7 @@ mod tests {
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
-            detect_reset_notify: Arc::new(Notify::new()),
+            detect_reset_notify: Arc::new(AgentDetectionWake::default()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,

@@ -234,8 +234,8 @@ impl TerminalRuntime {
         self.0.begin_graceful_release(agent);
     }
 
-    pub fn reset_agent_detection(&self) {
-        self.0.reset_agent_detection();
+    pub fn refresh_agent_detection(&self) {
+        self.0.refresh_agent_detection();
     }
 
     #[cfg(test)]
@@ -243,6 +243,11 @@ impl TerminalRuntime {
         &self,
     ) -> std::sync::Arc<tokio::sync::Notify> {
         self.0.agent_detection_reset_notify_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_detection_reset_requested_for_test(&self) -> bool {
+        self.0.agent_detection_reset_requested_for_test()
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
